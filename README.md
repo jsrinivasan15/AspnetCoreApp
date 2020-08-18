@@ -1,0 +1,2 @@
+# AspnetCoreApp
+TestApp
