@@ -2228,3 +2228,578 @@ await foreach (var message in chat.InvokeAsync())
 ### 42. Scheduler Agent Supervisor
 ### 43. Static Content Editing
 ### 44. AI Agent Orchestration
+
+---
+
+## **Complete ASP.NET Core Web App: Loan Processing with Resiliency Patterns (10-15)**
+
+*A production-ready example combining Retry, Circuit Breaker, Bulkhead, Health Monitoring, Throttling, and Rate Limiting.*
+
+### **Scenario**
+A Loan Processing API that:
+- Calls an external Credit Bureau API (with retries on transient failures)
+- Has a circuit breaker if Credit Bureau keeps failing
+- Uses bulkheads to isolate credit checks from income verifications
+- Expires `/health` endpoints for Kubernetes
+- Throttles requests per user to prevent abuse
+- Rate-limits partners to a quota per hour
+
+### **Project Structure**
+```
+LoanProcessingApi/
+├── Program.cs
+├── Models/
+│   ├── LoanApplicationDto.cs
+│   ├── CreditCheckDto.cs
+│   └── LoanDecisionDto.cs
+├── Services/
+│   ├── CreditBureauService.cs
+│   ├── IncomeVerificationService.cs
+│   └── LoanUnderwritingService.cs
+├── Controllers/
+│   ├── LoansController.cs
+│   └── HealthController.cs
+├── appsettings.json
+└── appsettings.Development.json
+```
+
+### **Stage 1: Models**
+
+```csharp
+// Models/LoanApplicationDto.cs
+public class LoanApplicationDto
+{
+    public string ApplicantName { get; set; } = "";
+    public string SSN { get; set; } = "";
+    public decimal RequestedAmount { get; set; }
+    public int TermYears { get; set; }
+    public decimal AnnualIncome { get; set; }
+}
+
+// Models/CreditCheckDto.cs
+public class CreditCheckDto
+{
+    public string SSN { get; set; } = "";
+    public int CreditScore { get; set; }
+    public string Status { get; set; } = "";  // "Approved", "Denied", "Review"
+    public DateTime CheckedAt { get; set; }
+}
+
+// Models/LoanDecisionDto.cs
+public class LoanDecisionDto
+{
+    public bool IsApproved { get; set; }
+    public decimal ApprovedAmount { get; set; }
+    public string Reason { get; set; } = "";
+    public int CreditScore { get; set; }
+    public decimal DebtToIncomeRatio { get; set; }
+}
+```
+
+### **Stage 2: Services with Resilience**
+
+```csharp
+// Services/CreditBureauService.cs
+// This service demonstrates: Retry + Circuit Breaker
+public class CreditBureauService
+{
+    private readonly HttpClient _httpClient;
+    private readonly ILogger<CreditBureauService> _logger;
+
+    public CreditBureauService(HttpClient httpClient, ILogger<CreditBureauService> logger)
+    {
+        _httpClient = httpClient;
+        _logger = logger;
+    }
+
+    public async Task<CreditCheckDto> CheckCreditAsync(string ssn)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync($"/api/credit/check/{ssn}");
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            _logger.LogInformation("Credit check SUCCESS for {SSN}", ssn);
+            return JsonSerializer.Deserialize<CreditCheckDto>(json) 
+                ?? throw new InvalidOperationException("No data returned");
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "Credit check FAILED for {SSN}", ssn);
+            throw;
+        }
+    }
+}
+
+// Services/IncomeVerificationService.cs
+// This service demonstrates: Bulkhead (separate from credit checks)
+public class IncomeVerificationService
+{
+    private readonly ILogger<IncomeVerificationService> _logger;
+
+    public IncomeVerificationService(ILogger<IncomeVerificationService> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<decimal> VerifyIncomeAsync(string ssn, decimal claimedIncome)
+    {
+        _logger.LogInformation("Verifying income for {SSN}", ssn);
+
+        // Simulate IRS/employer lookup
+        await Task.Delay(100);
+
+        var verifiedIncome = claimedIncome * 0.95m;  // 95% of claimed
+        _logger.LogInformation("Income verified: {VerifiedIncome}", verifiedIncome);
+        return verifiedIncome;
+    }
+}
+
+// Services/LoanUnderwritingService.cs
+// Coordinates the underwriting process
+public class LoanUnderwritingService
+{
+    private readonly CreditBureauService _creditService;
+    private readonly IncomeVerificationService _incomeService;
+    private readonly ILogger<LoanUnderwritingService> _logger;
+
+    public LoanUnderwritingService(
+        CreditBureauService creditService,
+        IncomeVerificationService incomeService,
+        ILogger<LoanUnderwritingService> logger)
+    {
+        _creditService = creditService;
+        _incomeService = incomeService;
+        _logger = logger;
+    }
+
+    public async Task<LoanDecisionDto> UnderwriteAsync(LoanApplicationDto app)
+    {
+        try
+        {
+            // Call credit check (has Retry + Circuit Breaker)
+            var creditCheck = await _creditService.CheckCreditAsync(app.SSN);
+
+            // Call income verification (separate Bulkhead)
+            var verifiedIncome = await _incomeService.VerifyIncomeAsync(app.SSN, app.AnnualIncome);
+
+            // Decision logic
+            var dti = (app.RequestedAmount * 12 / app.TermYears) / verifiedIncome;
+
+            var approved = creditCheck.CreditScore >= 650 && dti < 0.43m;
+
+            return new LoanDecisionDto
+            {
+                IsApproved = approved,
+                ApprovedAmount = approved ? app.RequestedAmount : 0,
+                Reason = approved ? "Approved" : "Credit score or debt-to-income too high",
+                CreditScore = creditCheck.CreditScore,
+                DebtToIncomeRatio = dti
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Underwriting failed");
+            throw;
+        }
+    }
+}
+```
+
+### **Stage 3: Program.cs (All Patterns Configured)**
+
+```csharp
+// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+// ===== PATTERN 10 & 11: Configure HttpClient with Retry + Circuit Breaker =====
+builder.Services.AddHttpClient<CreditBureauService>("CreditBureau", client =>
+    {
+        client.BaseAddress = new Uri("https://api.creditbureau.com");
+        client.DefaultRequestHeaders.Add("X-Api-Key", builder.Configuration["CreditBureau:ApiKey"] ?? "test-key");
+        client.Timeout = TimeSpan.FromSeconds(10);
+    })
+    // Retry: exponential backoff on transient failures
+    .AddTransientHttpErrorPolicy(p =>
+        p.WaitAndRetryAsync(3, attempt =>
+            TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt)),
+            onRetry: (outcome, delay, attempt, _) =>
+            {
+                var logger = builder.Services.BuildServiceProvider()
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("HttpClientRetry");
+                logger.LogWarning("Retry {Attempt} after {DelayMs}ms: {Status}",
+                    attempt, delay.TotalMilliseconds, outcome.Result?.StatusCode);
+            }))
+    // Circuit Breaker: trip after 5 consecutive failures, reset after 30s
+    .AddTransientHttpErrorPolicy(p =>
+        p.CircuitBreakerAsync(
+            handledEventsAllowedBeforeBreaking: 5,
+            durationOfBreak: TimeSpan.FromSeconds(30),
+            onBreak: (outcome, duration) =>
+            {
+                var logger = builder.Services.BuildServiceProvider()
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("CircuitBreaker");
+                logger.LogCritical("Circuit OPEN for {Duration}s", duration.TotalSeconds);
+            },
+            onReset: () =>
+            {
+                var logger = builder.Services.BuildServiceProvider()
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("CircuitBreaker");
+                logger.LogInformation("Circuit CLOSED - service recovered");
+            }));
+
+// ===== PATTERN 12: Bulkhead for Income Verification =====
+builder.Services.Configure<BulkheadPolicyOptions>(options =>
+{
+    options.MaxParallelization = 50;  // Max 50 concurrent income verifications
+    options.MaxQueuingActions = 25;   // Queue up to 25 more
+});
+
+// ===== Dependency Injection =====
+builder.Services.AddScoped<CreditBureauService>();
+builder.Services.AddScoped<IncomeVerificationService>();
+builder.Services.AddScoped<LoanUnderwritingService>();
+
+builder.Services.AddControllers();
+
+// ===== PATTERN 13: Health Endpoint Monitoring =====
+builder.Services.AddHealthChecks()
+    .AddUrlGroup(
+        new Uri("https://api.creditbureau.com/health"),
+        name: "credit-bureau",
+        timeout: TimeSpan.FromSeconds(5))
+    .AddCheck("database", () => HealthCheckResult.Healthy())  // Placeholder
+    .AddCheck("memory", () =>
+    {
+        var workingSet = GC.GetTotalMemory(false);
+        return workingSet < 500_000_000  // < 500MB
+            ? HealthCheckResult.Healthy()
+            : HealthCheckResult.Degraded();
+    });
+
+builder.Services
+    .AddHealthChecksUI()
+    .AddInMemoryStorage();
+
+// ===== PATTERN 14 & 15: Throttling + Rate Limiting =====
+builder.Services.AddRateLimiter(options =>
+{
+    // PATTERN 14: Throttling - Per-user concurrency limit
+    options.AddPolicy("throttle-user", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.User?.Identity?.Name 
+                ?? context.Connection.RemoteIpAddress?.ToString() 
+                ?? "anonymous",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromSeconds(10),
+                QueueLimit = 0
+            }));
+
+    // PATTERN 15: Rate Limiting - Partner quotas per hour
+    options.AddPolicy("rate-limit-partner", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Request.Headers["X-Partner-Id"].ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 1000,
+                Window = TimeSpan.FromHours(1),
+                QueueLimit = 100
+            }));
+
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (ctx, _) =>
+    {
+        ctx.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        await ctx.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            error = "Too many requests",
+            retryAfter = ctx.HttpContext.Response.Headers["Retry-After"]
+        });
+    };
+});
+
+var app = builder.Build();
+
+// Use the Retry/Circuit Breaker for HttpClient
+app.UseRateLimiter();
+
+// ===== Map Health Endpoints =====
+app.MapHealthChecks("/health", new HealthCheckOptions
+{
+    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+});
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});
+
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = _ => false  // Just checks if process is alive
+});
+
+app.MapHealthChecksUI(options =>
+{
+    options.UIPath = "/admin/health";
+    options.ResourcesPath = "/health-ui";
+});
+
+app.MapControllers();
+app.Run();
+
+public class BulkheadPolicyOptions
+{
+    public int MaxParallelization { get; set; } = 50;
+    public int MaxQueuingActions { get; set; } = 25;
+}
+```
+
+### **Stage 4: Controllers**
+
+```csharp
+// Controllers/LoansController.cs
+[ApiController]
+[Route("api/[controller]")]
+public class LoansController : ControllerBase
+{
+    private readonly LoanUnderwritingService _underwriting;
+    private readonly ILogger<LoansController> _logger;
+
+    public LoansController(LoanUnderwritingService underwriting, ILogger<LoansController> logger)
+    {
+        _underwriting = underwriting;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Apply for a loan — Throttled per user (10 requests/10s)
+    /// </summary>
+    [HttpPost("apply")]
+    [EnableRateLimiting("throttle-user")]  // PATTERN 14: Throttling
+    public async Task<IActionResult> ApplyForLoan(LoanApplicationDto application)
+    {
+        _logger.LogInformation("Loan application received from {Name}", application.ApplicantName);
+
+        try
+        {
+            // Underwriting calls:
+            // - CreditBureauService (Retry + Circuit Breaker)
+            // - IncomeVerificationService (Bulkhead)
+            var decision = await _underwriting.UnderwriteAsync(application);
+
+            return Ok(new
+            {
+                approved = decision.IsApproved,
+                amount = decision.ApprovedAmount,
+                reason = decision.Reason,
+                creditScore = decision.CreditScore,
+                dtiRatio = decision.DebtToIncomeRatio
+            });
+        }
+        catch (HttpRequestException ex) when (ex.InnerException is OperationCanceledException)
+        {
+            _logger.LogError(ex, "Credit check timeout");
+            return StatusCode(503, new { error = "Credit bureau unavailable — please try again" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Loan processing failed");
+            return StatusCode(500, new { error = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Partner portal — Rate limited to 1000 requests/hour
+    /// </summary>
+    [HttpGet("partner/status/{applicantId}")]
+    [EnableRateLimiting("rate-limit-partner")]  // PATTERN 15: Rate Limiting
+    public IActionResult PartnerGetStatus(string applicantId)
+    {
+        var partnerId = Request.Headers["X-Partner-Id"].ToString();
+        _logger.LogInformation("Partner {Id} querying status", partnerId);
+
+        return Ok(new { applicantId, status = "Processing", partnerId });
+    }
+
+    /// <summary>
+    /// Internal admin endpoint — no rate limiting
+    /// </summary>
+    [HttpGet("admin/stats")]
+    public IActionResult AdminStats()
+    {
+        return Ok(new
+        {
+            applicationsToday = 42,
+            approvalRate = 0.68m,
+            avgProcessingTimeMs = 1234
+        });
+    }
+}
+
+// Controllers/HealthController.cs
+[ApiController]
+[Route("api/[controller]")]
+public class HealthController : ControllerBase
+{
+    private readonly IHealthCheckService _healthCheckService;
+    private readonly ILogger<HealthController> _logger;
+
+    public HealthController(IHealthCheckService healthCheckService, ILogger<HealthController> logger)
+    {
+        _healthCheckService = healthCheckService;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Kubernetes Liveness Probe — is the process alive?
+    /// </summary>
+    [HttpGet("live")]
+    public IActionResult Live()
+    {
+        return Ok(new { status = "alive" });
+    }
+
+    /// <summary>
+    /// Kubernetes Readiness Probe — can it serve traffic?
+    /// </summary>
+    [HttpGet("ready")]
+    public async Task<IActionResult> Ready()
+    {
+        var result = await _healthCheckService.CheckHealthAsync();
+
+        return result.Status == HealthStatus.Healthy
+            ? Ok(new { status = "ready", checks = result.Entries.Keys })
+            : StatusCode(503, new { status = "not-ready", failures = result.Entries
+                .Where(e => e.Value.Status != HealthStatus.Healthy)
+                .Select(e => e.Key) });
+    }
+}
+```
+
+### **Stage 5: Configuration (appsettings.json)**
+
+```json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning",
+      "HttpClientRetry": "Debug",
+      "CircuitBreaker": "Warning"
+    }
+  },
+  "CreditBureau": {
+    "ApiKey": "your-key-here"
+  },
+  "AllowedHosts": "*"
+}
+```
+
+### **Stage 6: Running the App**
+
+```bash
+# 1. Create project
+dotnet new webapi -n LoanProcessingApi
+cd LoanProcessingApi
+
+# 2. Add NuGet packages
+dotnet add package Microsoft.Extensions.Http.Resilience
+dotnet add package Polly
+dotnet add package AspNetCore.HealthChecks.UI
+dotnet add package AspNetCore.HealthChecks.Uris
+
+# 3. Run
+dotnet run
+
+# 4. Test endpoints
+
+# Test Throttling (10 requests/10s per user)
+curl -X POST http://localhost:5000/api/loans/apply \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer user123" \
+  -d '{"applicantName":"John","ssn":"123-45-6789","requestedAmount":50000,"termYears":30,"annualIncome":75000}'
+
+# Test Rate Limiting (1000 requests/hour per partner)
+curl -X GET http://localhost:5000/api/loans/partner/status/app-001 \
+  -H "X-Partner-Id: partner-bank-xyz"
+
+# Test Health Endpoints
+curl http://localhost:5000/health       # Full status
+curl http://localhost:5000/health/live  # Liveness probe
+curl http://localhost:5000/health/ready # Readiness probe
+curl http://localhost:5000/admin/health # UI dashboard
+```
+
+### **What Each Pattern Does in This Example**
+
+| Pattern | Where | What Happens |
+|---|---|---|
+| **Retry** | CreditBureauService | If credit bureau returns 500, retry up to 3 times with 200ms, 400ms, 800ms delays |
+| **Circuit Breaker** | CreditBureauService | After 5 consecutive failed requests, "trip" the circuit and immediately reject requests for 30s |
+| **Bulkhead** | IncomeVerificationService | Max 50 concurrent income checks; excess requests queue or fail with 429 |
+| **Health Monitoring** | `/health/*` endpoints | Kubernetes probes check if process is alive, if it's ready to serve traffic, and dependency status |
+| **Throttling** | `POST /api/loans/apply` | Each user can submit max 10 loan applications per 10 seconds |
+| **Rate Limiting** | `GET /api/loans/partner/status` | Each partner bank can make 1000 API calls per hour |
+
+### **Real-World Scenario**
+
+```
+Day 1: Loan processor tries to apply for a mortgage
+  POST /api/loans/apply (User: "john@bank.com")
+  ✅ Throttling: 1st request today — allowed
+  Credit Bureau responds in 500ms
+  ✅ Retry: Not needed
+  ✅ Circuit Breaker: CLOSED (healthy)
+  ✅ Bulkhead: Income check uses 1/50 slots
+  ✅ Health: All dependencies healthy
+  Result: Approved with $250,000
+
+Same day: Credit Bureau goes down (disk failure)
+  POST /api/loans/apply (User: "jane@bank.com")
+  ✅ Throttling: Allowed
+  Credit Bureau: Connection refused
+  🔄 Retry #1: Wait 200ms, retry... Connection refused
+  🔄 Retry #2: Wait 400ms, retry... Connection refused
+  🔄 Retry #3: Wait 800ms, retry... Connection refused
+  ❌ Circuit Breaker: TRIPS (5 failures)
+  Result: 503 Service Unavailable — "Credit bureau offline, please try again"
+
+30 seconds later: Credit Bureau back online
+  POST /api/loans/apply (User: "bob@bank.com")
+  ✅ Circuit Breaker: Half-open, tries one test request
+  Credit Bureau: 200 OK
+  ✅ Circuit Breaker: CLOSES
+  Result: Approved
+
+Aggressive bot tries 100 requests/second to bypass system:
+  POST /api/loans/apply (over and over)
+  ❌ Request #11: Throttling — 429 Too Many Requests
+  ❌ Request #12-100: 429 Too Many Requests
+  Result: Bot is blocked; legitimate users unaffected
+
+Partner bank tries to abuse the API:
+  GET /api/loans/partner/status x 2,000 in one hour
+  ✅ Requests #1-1000: 200 OK
+  ❌ Request #1001: Rate Limiting — 429 Too Many Requests
+  Result: Partner quota enforced; can retry next hour
+```
+
+### **Summary**
+
+This complete ASP.NET Core app demonstrates:
+
+1. ✅ **Retry** — Automatic recovery from transient failures
+2. ✅ **Circuit Breaker** — Prevents cascading failures
+3. ✅ **Bulkhead** — Isolates workloads so one failure doesn't starve others
+4. ✅ **Health Monitoring** — Tells orchestrators (Kubernetes) the app's status
+5. ✅ **Throttling** — Protects against user abuse
+6. ✅ **Rate Limiting** — Enforces partner quotas
+
+All implemented in a production-ready, fully-configured ASP.NET Core application.
