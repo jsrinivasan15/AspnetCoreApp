@@ -1,0 +1,31 @@
+PI Data Security Strategies
+1. Minimize Collection
+Collect only the PI data strictly needed for the business purpose.
+Use data classification to identify what counts as PI and avoid unnecessary storage.
+2. Protect Data in Transit
+Use TLS/SSL for all network communication.
+Enforce HTTPS everywhere and disable insecure protocols.
+3. Protect Data at Rest
+Encrypt PI using strong algorithms (AES-256).
+Use managed key stores or hardware security modules (HSMs) for key management.
+4. Access Control
+Apply least privilege access for users, services, and applications.
+Use strong authentication (MFA) and role-based access control (RBAC).
+5. Data Masking and Tokenization
+Mask or redact PI in logs, UIs, and reports.
+Tokenize sensitive values so raw PI is not stored in primary systems.
+6. Auditing and Monitoring
+Log access to PI and monitor for suspicious activity.
+Keep audit trails for changes, access, and data exports.
+7. Data Retention and Disposal
+Define clear retention policies for PI.
+Securely delete or anonymize PI when no longer needed.
+8. Segmentation and Isolation
+Segment networks and systems that handle PI.
+Isolate PI processing from lower-security environments.
+9. Secure Development Practices
+Use secure coding standards to prevent injection, XSS, CSRF, and other vulnerabilities.
+Validate and sanitize all input that may include PI.
+10. Compliance and Policy
+Align with relevant regulations and standards (GDPR, CCPA, PCI DSS, ISO 27001).
+Document policies, train staff, and review them regularly.
